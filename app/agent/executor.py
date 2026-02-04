@@ -1,43 +1,54 @@
-from app.agent.planner import select_strategy
-from app.agent.strategies import Strategy
+import re
 from app.agent.llm import generate_reply
-from app.agent.intelligence import extract_intelligence
+from app.agent.callback import send_final_result
+
+
+URL_REGEX = re.compile(r"https?://\S+")
+UPI_REGEX = re.compile(r"\b[\w.-]+@upi\b", re.IGNORECASE)
 
 
 def run_agent(state: dict) -> dict:
-    strategy = select_strategy(state)
-    state["strategy_state"]["current_strategy"] = strategy.value
+    turns = state["metrics"]["turns"]
+    risk = state["risk_state"]["exposure_risk"]
 
-    explanation = []
+    # ---- STRATEGY SELECTION ----
+    if turns <= 2:
+        strategy = "trust_building"
+    elif risk < 0.5:
+        strategy = "clarify"
+    else:
+        strategy = "extract"
 
-    # Explainability hook
-    explanation.append(f"stage={state['conversation_stage']['current']}")
-    explanation.append(f"risk={state['risk_state']['exposure_risk']}")
-    explanation.append(f"turns={state['metrics']['turns']}")
+    # ---- GENERATE REPLY ----
+    reply = generate_reply(strategy, state)
 
-    # Trust-building transition
-    if strategy == Strategy.PROBE:
-        if state["conversation_stage"]["current"] == "engaged":
-            state["conversation_stage"]["previous"] = "engaged"
-            state["conversation_stage"]["current"] = "trust_building"
-            state["conversation_stage"]["stage_entry_turn"] = state["metrics"]["turns"]
-            explanation.append("transitioned_to=trust_building")
+    # ---- INTEL EXTRACTION ----
+    text = state["last_message"]["content"]
+    intel = {}
 
-    # Exit handling
-    if strategy == Strategy.EXIT:
-        state["termination_state"]["exit_required"] = True
-        state["termination_state"]["exit_style"] = "technical_failure"
+    links = URL_REGEX.findall(text)
+    upis = UPI_REGEX.findall(text)
 
-    reply = generate_reply(strategy.value, state)
+    if links:
+        intel["phishing_url"] = links
+    if upis:
+        intel["upi_id"] = upis
 
-    # Structured intelligence extraction
-    intel = extract_intelligence(state["last_message"]["content"], state)
     if intel:
         state["evaluation_state"]["intel_gained"].append(intel)
 
+    # ---- EXIT CONDITION ----
+    explanation = f"stage={state['conversation_stage']['current']}; risk={risk}; turns={turns}"
+
+    if risk >= 0.8 or turns >= 15:
+        state["termination_state"]["exit_required"] = True
+        state["termination_state"]["exit_reason"] = "risk_or_depth"
+        send_final_result(state)
+        explanation += "; final_callback_sent"
+
     return {
-        "strategy": strategy.value,
         "reply": reply,
-        "explanation": "; ".join(explanation),
-        "intel_extracted": intel if intel else None
+        "strategy": strategy,
+        "intel_extracted": intel,
+        "explanation": explanation
     }

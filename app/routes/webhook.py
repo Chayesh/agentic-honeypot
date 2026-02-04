@@ -1,4 +1,7 @@
 from fastapi import APIRouter, Header, HTTPException
+from uuid import uuid4
+from datetime import datetime
+
 from app.storage.redis_store import get_state, save_state
 from app.agent.state import initialize_state
 from app.agent.detector import detect_scam
@@ -9,56 +12,74 @@ router = APIRouter()
 
 
 @router.post("/webhook/message")
-async def receive_message(
-    payload: dict,
-    x_api_key: str = Header(None)
-):
+async def receive_message(payload: dict, x_api_key: str = Header(None)):
+    # ------------------ AUTH ------------------
     if x_api_key != settings.API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    conversation_id = payload.get("conversation_id")
-    message = payload.get("message")
-    timestamp = payload.get("timestamp")
+    # ------------------ NORMALIZE INPUT ------------------
+    session_id = (
+        payload.get("sessionId")
+        or payload.get("conversation_id")
+        or f"auto-{uuid4()}"
+    )
 
-    if not conversation_id or not message:
-        raise HTTPException(status_code=400, detail="Invalid payload")
+    message_obj = payload.get("message", {})
+    message_text = (
+        message_obj.get("text")
+        if isinstance(message_obj, dict)
+        else payload.get("message")
+    ) or "[EMPTY_MESSAGE]"
 
-    state = get_state(conversation_id)
+    timestamp = (
+        message_obj.get("timestamp")
+        if isinstance(message_obj, dict)
+        else payload.get("timestamp")
+    ) or int(datetime.utcnow().timestamp() * 1000)
+
+    conversation_history = payload.get("conversationHistory", [])
+    metadata = payload.get("metadata", {})
+
+    # ------------------ LOAD / INIT STATE ------------------
+    state = get_state(session_id)
     if not state:
-        state = initialize_state(conversation_id)
+        state = initialize_state(session_id)
 
-    # Metrics
+    # ------------------ METRICS ------------------
     state["metrics"]["turns"] += 1
     if not state["metrics"]["engagement_start"]:
         state["metrics"]["engagement_start"] = timestamp
 
-    # Store message
-    state["last_message"] = {"from": "scammer", "content": message}
+    # ------------------ MEMORY ------------------
+    state["last_message"] = {
+        "from": "scammer",
+        "content": message_text,
+        "timestamp": timestamp,
+    }
 
-    # Scam detection
-    detection = detect_scam(message)
+    state["memory"]["history"] = conversation_history
+    state["memory"]["metadata"] = metadata
 
-    # --- CONFIDENCE UPDATE (IMPORTANT FIX) ---
+    # ------------------ DETECTION ------------------
+    detection = detect_scam(message_text)
+
     if detection["confidence"] > 0:
         state["scam_assessment"]["confidence"] = max(
             state["scam_assessment"]["confidence"],
             detection["confidence"]
         )
     else:
-        # confidence decay on benign input
         state["scam_assessment"]["confidence"] = max(
             0.0,
             state["scam_assessment"]["confidence"] - 0.1
         )
 
     state["scam_assessment"]["scam_type"] = detection["scam_type"]
-
-    # Scam detected threshold
     state["scam_assessment"]["scam_detected"] = (
         state["scam_assessment"]["confidence"] >= 0.5
     )
 
-    # Exposure risk
+    # ------------------ RISK ------------------
     if detection["signals"]["urgency"]:
         state["risk_state"]["exposure_risk"] += 0.1
     if detection["signals"]["link"]:
@@ -68,7 +89,7 @@ async def receive_message(
         state["risk_state"]["exposure_risk"], 1.0
     )
 
-    # Stage transition
+    # ------------------ STAGE ------------------
     if state["scam_assessment"]["scam_detected"]:
         if state["conversation_stage"]["current"] == "passive":
             state["conversation_stage"]["previous"] = "passive"
@@ -77,19 +98,22 @@ async def receive_message(
     else:
         state["conversation_stage"]["current"] = "passive"
 
+    # ------------------ AGENT ------------------
     agent_output = None
     if state["conversation_stage"]["current"] != "passive":
         agent_output = run_agent(state)
 
-    save_state(conversation_id, state)
+    save_state(session_id, state)
 
+    # ------------------ RESPONSE (MATCHES SPEC) ------------------
     return {
-        "conversation_id": conversation_id,
-        "scam_detected": state["scam_assessment"]["scam_detected"],
+        "status": "success",
+        "sessionId": session_id,
+        "scamDetected": state["scam_assessment"]["scam_detected"],
         "stage": state["conversation_stage"]["current"],
         "risk": round(state["risk_state"]["exposure_risk"], 2),
+        "reply": agent_output["reply"] if agent_output else None,
         "strategy": agent_output["strategy"] if agent_output else None,
-        "agent_reply": agent_output["reply"] if agent_output else None,
-        "intel": agent_output["intel_extracted"] if agent_output else None,
-        "explanation": agent_output["explanation"] if agent_output else None
+        "intel": agent_output["intel_extracted"] if agent_output else {},
+        "explanation": agent_output["explanation"] if agent_output else "passive_monitoring"
     }

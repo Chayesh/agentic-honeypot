@@ -4,3 +4,4 @@ redis
 pydantic
 python-dotenv
 openai
+requests

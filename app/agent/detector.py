@@ -1,37 +1,42 @@
 import re
 
-URGENCY_KEYWORDS = [
-    "urgent", "immediately", "24 hours", "blocked", "suspended"
+SCAM_KEYWORDS = [
+    "kyc", "blocked", "suspended", "verify",
+    "urgent", "click", "immediately", "pay",
+    "upi", "account", "warning"
 ]
 
-AUTHORITY_KEYWORDS = [
-    "bank", "kyc", "account", "verification"
-]
-
-ACTION_KEYWORDS = [
-    "click", "update", "pay", "submit"
-]
+URL_REGEX = re.compile(r"https?://\S+")
+UPI_REGEX = re.compile(r"\b[\w.-]+@upi\b", re.IGNORECASE)
+PHONE_REGEX = re.compile(r"\b\d{10}\b")
 
 
-def detect_scam(message: str) -> dict:
-    text = message.lower()
+def detect_scam(text: str) -> dict:
+    text_lower = text.lower()
 
-    signals = {
-        "urgency": any(k in text for k in URGENCY_KEYWORDS),
-        "authority": any(k in text for k in AUTHORITY_KEYWORDS),
-        "action": any(k in text for k in ACTION_KEYWORDS),
-        "link": bool(re.search(r"https?://", text))
-    }
+    keyword_hits = [k for k in SCAM_KEYWORDS if k in text_lower]
+    has_link = bool(URL_REGEX.search(text))
+    has_upi = bool(UPI_REGEX.search(text))
+    has_phone = bool(PHONE_REGEX.search(text))
+    has_urgency = any(w in text_lower for w in ["urgent", "immediately", "final"])
 
-    score = sum(1 for v in signals.values() if v)
-    confidence = score / len(signals)
+    confidence = 0.0
+    confidence += 0.15 * len(keyword_hits)
+    confidence += 0.2 if has_link else 0
+    confidence += 0.2 if has_upi else 0
+    confidence += 0.1 if has_phone else 0
+    confidence += 0.1 if has_urgency else 0
 
-    scam_type = None
-    if signals["authority"] and signals["action"]:
-        scam_type = "phishing"
+    confidence = min(confidence, 1.0)
 
     return {
-        "signals": signals,
-        "confidence": round(confidence, 2),
-        "scam_type": scam_type
+        "confidence": confidence,
+        "scam_type": "phishing" if has_link else "payment_fraud" if has_upi else None,
+        "signals": {
+            "keywords": keyword_hits,
+            "link": has_link,
+            "upi": has_upi,
+            "phone": has_phone,
+            "urgency": has_urgency
+        }
     }
