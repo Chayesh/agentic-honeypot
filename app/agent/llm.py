@@ -1,28 +1,44 @@
 from openai import OpenAI
 from app.config import settings
+from app.agent.prompts import STRATEGY_PROMPTS
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-
 def generate_reply(strategy: str, state: dict) -> str:
+    system_prompt = STRATEGY_PROMPTS[strategy]
+
+    history = state.get("memory", {}).get("commitments", {}).get("agent", [])
+    last_reply = history[-1] if history else ""
+
     prompt = f"""
-You are a normal, non-technical user.
-Do NOT reveal you suspect a scam.
+{system_prompt}
 
-Strategy: {strategy}
-Last message: {state['last_message']['content']}
+Previous reply (do NOT repeat):
+"{last_reply}"
 
-Respond naturally in one short sentence.
+Latest scammer message:
+"{state['last_message']['content']}"
+
+Respond naturally in 1–2 sentences.
 """
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=60
+            messages=[
+                {"role": "system", "content": prompt}
+            ],
+            max_tokens=80,
+            temperature=0.7
         )
         return response.choices[0].message.content.strip()
+
     except Exception:
-        # HARD fallback (mandatory for evaluation)
-        return "Can you please explain that again?"
+        # SAFE FALLBACK (never repeat!)
+        fallbacks = {
+            "trust_building": "I’m not fully understanding what happened to my account.",
+            "verification_trap": "Is there any reference number I can check?",
+            "extraction": "Which account are you referring to exactly?",
+            "slow_play": "The app is taking time to load, please stay."
+        }
+        return fallbacks[strategy]
